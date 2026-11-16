@@ -79,11 +79,11 @@ def _teardown_env(env: Any, task_id: str, *, force_remove: Optional[bool] = None
             logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
-def _clear_file_ops_cache(task_id: str) -> None:
+def _clear_file_ops_cache(task_id: str, *, preserve_read_state: bool = False) -> None:
     """Invalidate the file_ops cache entry so ShellFileOperations can't reference a dead sandbox."""
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(task_id, preserve_read_state=preserve_read_state)
     except ImportError:
         pass
 
@@ -167,7 +167,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
                 _creation_locks.pop(t, None)
     for task_id, env in envs_to_stop:
         if env is not None:
-            _clear_file_ops_cache(task_id)
+            _clear_file_ops_cache(task_id, preserve_read_state=True)
             if _is_workspace_key(task_id) and callable(getattr(env, "stop_idle", None)):
                 # Persistent per-workspace container: stop it (state kept, restarted on next use)
                 # instead of leaving it running forever like the one profile container.
@@ -258,16 +258,20 @@ def ensure_task_env(task_id: Optional[str] = None):
 def is_persistent_env(task_id: str) -> bool:
     """True if *task_id*'s active env persists across turns.
 
-    The agent loop skips per-turn teardown for these (persistent docker,
-    daytona, modal, …); non-persistent backends are torn down at end of turn
-    to prevent leakage, and the idle reaper handles the rest. Session-scoped
-    docker containers count as persistent HERE: their lifetime is the session
-    (removed by ``AIAgent.close()`` → ``cleanup_vm`` and the idle reaper).
+    The agent loop skips per-turn teardown for these (persistent local shell,
+    persistent docker, daytona, modal, …); non-persistent backends are torn down
+    at end of turn to prevent leakage, and the idle reaper handles the rest.
+    Session-scoped docker containers count as persistent HERE: their lifetime is
+    the session (removed by ``AIAgent.close()`` → ``cleanup_vm`` and the idle reaper).
     """
     env = get_active_env(task_id)
     if env is None:
         return False
-    return bool(getattr(env, "_session_scoped", False) or getattr(env, "_persistent", False))
+    return bool(
+        getattr(env, "_session_scoped", False)
+        or getattr(env, "_persistent", False)
+        or getattr(env, "_persist_env", False)
+    )
 
 
 def cleanup_all_environments():

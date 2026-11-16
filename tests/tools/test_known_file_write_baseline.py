@@ -334,3 +334,22 @@ def test_third_patch_failure_hint_requires_a_full_reread_before_write_file(tmp_p
     assert "failure #3" in hint
     assert "re-read the file in full, then use write_file to replace it" in hint
     assert "use write_file to replace the entire file" not in hint
+
+
+def test_write_baseline_survives_per_turn_cleanup_on_persistent_local_env(tmp_path, task):
+    """Regression: per-turn ``cleanup_task_resources`` must not tear down a
+    persistent ``LocalEnvironment`` (``_persist_env=True``) or wipe the
+    session's ``full_write_baselines`` between turns."""
+    from types import SimpleNamespace
+    from agent.chat_completion_helpers import cleanup_task_resources
+    from tools.terminal_tool_lifecycle import cleanup_vm
+
+    path = tmp_path / "draft.txt"
+    try:
+        _ok(_write(path, task, "turn 1 draft\n"))
+        cleanup_task_resources(SimpleNamespace(verbose_logging=False), task)
+        _ok(_write(path, task, "turn 2 updated draft\n"))
+        assert path.read_text() == "turn 2 updated draft\n"
+    finally:
+        cleanup_vm(task)
+
