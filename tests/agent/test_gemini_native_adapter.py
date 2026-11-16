@@ -1040,3 +1040,12 @@ def test_prompt_feedback_without_block_reason_keeps_empty_turn(monkeypatch):
     client = _blocking_client(monkeypatch, {"promptFeedback": {"safetyRatings": []}})
     out = client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "user", "content": "hi"}])
     assert out.choices[0].finish_reason == "stop"
+
+
+def test_scalar_timeout_preserves_connect_and_write_bounds():
+    import httpx
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    norm = GeminiNativeClient._normalize_timeout(600.0)
+    assert isinstance(norm, httpx.Timeout)
+    assert (norm.connect, norm.read, norm.write, norm.pool) == (15.0, 600.0, 30.0, 30.0)

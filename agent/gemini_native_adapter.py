@@ -942,6 +942,12 @@ class GeminiNativeClient:
         return gemini_http_error(response, body_text=body_text, api_key=self.api_key, base_url=self.base_url)
 
     @staticmethod
+    def _normalize_timeout(timeout: Any) -> Any:
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+            return httpx.Timeout(connect=15.0, read=float(timeout), write=30.0, pool=30.0)
+        return timeout
+
+    @staticmethod
     def _advance_stream_iterator(iterator: Iterator[_GeminiStreamChunk]) -> tuple[bool, Optional[_GeminiStreamChunk]]:
         chunk = next(iterator, _END)
         return (True, None) if chunk is _END else (False, chunk)
@@ -976,7 +982,7 @@ class GeminiNativeClient:
         return translate_gemini_response(merge_hop_responses(hops) if len(hops) > 1 else hops[0], model=model)
 
     def _generate(self, url: str, request: dict[str, Any], timeout: Any) -> dict[str, Any]:
-        response = self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
+        response = self._http.post(url, json=request, headers=self._headers(), timeout=self._normalize_timeout(timeout))
         if response.status_code != 200:
             raise self._http_error(response)
         try:
@@ -997,7 +1003,7 @@ class GeminiNativeClient:
         while True:
             try:
                 headers = {**self._headers(), "Accept": "text/event-stream"}
-                with self._http.stream("POST", url, json=body, headers=headers, timeout=timeout) as response:
+                with self._http.stream("POST", url, json=body, headers=headers, timeout=self._normalize_timeout(timeout)) as response:
                     if response.status_code != 200:
                         raise self._http_error(response, read_streaming_error_body(response))
                     for event in _iter_sse_events(response):
