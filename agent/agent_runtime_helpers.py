@@ -3537,16 +3537,23 @@ def _iter_pool_sockets(client: Any):
     httpcore internals (``conn._connection``, proxy tunnel wrappers) that vary by release; also
     walks mount transports and in-flight ``PoolRequest.connection`` objects (``_connections``
     is empty during checkout)."""
+    seen: set[int] = set()
+    active_resp = getattr(client, "_active_response", None)
+    if active_resp is not None:
+        with contextlib.suppress(Exception):
+            sock = _socket_from_response(active_resp)
+            if sock is not None:
+                seen.add(id(sock))
+                yield sock
     try:
         # Some SDK wrappers *are* the httpx client; fall through so mount-aware discovery runs.
-        http_client = getattr(client, "_client", None)
+        http_client = getattr(client, "_client", None) or getattr(client, "_http", None)
         pools = list(_iter_httpx_pools_with_owner(client if http_client is None else http_client))
     except Exception:
         return
     if not pools:
         return
     from agent.process_bootstrap import HERMES_TRANSPORT_OWNER_EXT
-    seen: set[int] = set()
     for pool, owner in pools:
         # ``is None``, not falsiness: an empty ``_connections`` must still let us walk in-flight ``_requests``.
         raw_conns = getattr(pool, "_connections", None)

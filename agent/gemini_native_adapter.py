@@ -894,6 +894,42 @@ def gemini_http_error(
     )
 
 
+class _GeminiStream:
+    """Iterable SSE stream wrapper that exposes the active ``httpx.Response`` on ``.response``."""
+
+    def __init__(self, make_gen) -> None:
+        self.response: Optional[httpx.Response] = None
+        self._on_response: Optional[Any] = None
+        self._closed = False
+        self._gen = make_gen(self)
+
+    def _set_response(self, response: Optional[httpx.Response]) -> None:
+        self.response = response
+        if response is not None and self._on_response is not None:
+            with contextlib.suppress(Exception):
+                self._on_response(response)
+
+    def __iter__(self) -> Iterator[_GeminiStreamChunk]:
+        return self
+
+    def __next__(self) -> _GeminiStreamChunk:
+        if self._closed:
+            raise StopIteration
+        return next(self._gen)
+
+    def close(self) -> None:
+        self._closed = True
+        with contextlib.suppress(Exception):
+            self._gen.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
 class GeminiNativeClient:
     """Minimal OpenAI-SDK-compatible facade (``client.chat.completions.create(**kwargs)``) over Gemini's native REST API."""
 
@@ -918,6 +954,8 @@ class GeminiNativeClient:
         # read=1200: Gemini 4 hops can think for minutes; Google asks for a >=20 min read timeout (its
         # stream limit), and a shorter one cuts long-decode hops off mid-think.
         self._http = http_client or httpx.Client(timeout=timeout or httpx.Timeout(connect=15.0, read=1200.0, write=30.0, pool=30.0))
+        self._client = self._http
+        self._active_response: Optional[Any] = None
 
     def close(self) -> None:
         self.is_closed = True
@@ -987,37 +1025,46 @@ class GeminiNativeClient:
             ) from exc
 
     def _stream_completion(self, model: str, url: str, request: dict[str, Any], timeout: Any) -> Iterator[_GeminiStreamChunk]:
-        tool_call_indices: dict[str, dict[str, Any]] = {}  # shared across hops: they form one model turn
-        hop_usage: list[dict[str, Any]] = []
-        max_hops = long_decode_hops(request["generationConfig"].get("maxOutputTokens")) + 1
-        body: dict[str, Any] = request
-        # ``resume``: the latest token (hop end or mid-stream checkpoint) with nothing yielded after it.
-        # The next hop, or a dropped stream, resends the request with it; ``sends`` bounds a stuck token.
-        resume, sends = None, 0
-        while True:
-            try:
-                headers = {**self._headers(), "Accept": "text/event-stream"}
-                with self._http.stream("POST", url, json=body, headers=headers, timeout=timeout) as response:
-                    if response.status_code != 200:
-                        raise self._http_error(response, read_streaming_error_body(response))
-                    for event in _iter_sse_events(response):
-                        hops_done = len(hop_usage)
-                        event, token = split_stream_continuation(event, hop_usage)
-                        if token and len(hop_usage) > hops_done and len(hop_usage) >= max_hops:
-                            # Hop ceiling: end the turn as truncated, usage summed over every hop.
-                            cand = {**event["candidates"][0], "finishReason": "MAX_TOKENS"}
-                            event, token = {**event, "candidates": [cand], "usageMetadata": merge_hop_usage(hop_usage)}, None
-                        chunks = translate_stream_event(event, model, tool_call_indices)
-                        if token or chunks:  # a token commits its own event's chunks; a later chunk voids it
-                            resume, sends = token, 0 if token else sends
-                        yield from chunks
-            except httpx.HTTPError as exc:
-                if not resume or sends >= _MAX_TOKEN_SENDS:  # nothing committed to resume from: retry from the start
-                    raise GeminiAPIError(f"Gemini streaming request failed: {exc}", code="gemini_stream_error") from exc
-                logger.warning("Gemini stream dropped (%s); resuming from its last checkpoint", exc)
-            if not resume or sends >= _MAX_TOKEN_SENDS:
-                return
-            body, sends = {**request, "continuationToken": resume}, sends + 1
+        def _iter_hops(stream_state: _GeminiStream) -> Iterator[_GeminiStreamChunk]:
+            tool_call_indices: dict[str, dict[str, Any]] = {}  # shared across hops: they form one model turn
+            hop_usage: list[dict[str, Any]] = []
+            max_hops = long_decode_hops(request["generationConfig"].get("maxOutputTokens")) + 1
+            body: dict[str, Any] = request
+            # ``resume``: the latest token (hop end or mid-stream checkpoint) with nothing yielded after it.
+            # The next hop, or a dropped stream, resends the request with it; ``sends`` bounds a stuck token.
+            resume, sends = None, 0
+            while True:
+                try:
+                    headers = {**self._headers(), "Accept": "text/event-stream"}
+                    with self._http.stream("POST", url, json=body, headers=headers, timeout=timeout) as response:
+                        self._active_response = response
+                        stream_state._set_response(response)
+                        try:
+                            if response.status_code != 200:
+                                raise self._http_error(response, read_streaming_error_body(response))
+                            for event in _iter_sse_events(response):
+                                hops_done = len(hop_usage)
+                                event, token = split_stream_continuation(event, hop_usage)
+                                if token and len(hop_usage) > hops_done and len(hop_usage) >= max_hops:
+                                    # Hop ceiling: end the turn as truncated, usage summed over every hop.
+                                    cand = {**event["candidates"][0], "finishReason": "MAX_TOKENS"}
+                                    event, token = {**event, "candidates": [cand], "usageMetadata": merge_hop_usage(hop_usage)}, None
+                                chunks = translate_stream_event(event, model, tool_call_indices)
+                                if token or chunks:  # a token commits its own event's chunks; a later chunk voids it
+                                    resume, sends = token, 0 if token else sends
+                                yield from chunks
+                        finally:
+                            self._active_response = None
+                            stream_state._set_response(None)
+                except httpx.HTTPError as exc:
+                    if not resume or sends >= _MAX_TOKEN_SENDS:  # nothing committed to resume from: retry from the start
+                        raise GeminiAPIError(f"Gemini streaming request failed: {exc}", code="gemini_stream_error") from exc
+                    logger.warning("Gemini stream dropped (%s); resuming from its last checkpoint", exc)
+                if not resume or sends >= _MAX_TOKEN_SENDS:
+                    return
+                body, sends = {**request, "continuationToken": resume}, sends + 1
+
+        return _GeminiStream(_iter_hops)
 
 
 class AsyncGeminiNativeClient:

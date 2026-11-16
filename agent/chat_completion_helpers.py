@@ -2939,12 +2939,20 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
+        if hasattr(raw_stream, "_on_response"):
+            raw_stream._on_response = self._on_late_stream_response
         self.agent._capture_rate_limits(response)
         self.agent._capture_credits(response)
         self.agent._capture_nous_model_switch(response)
         self.agent._stream_diag_capture_response(self.clients.diag, response)
         self.agent._check_openrouter_cache_status(response)
         self._writer_token = claim_stream_writer(self.agent)
+        self._reabort_if_cancelled(response)
+
+    def _on_late_stream_response(self, response: Any) -> None:
+        self._attempt_stream_response = response
+        self.agent._capture_rate_limits(response)
+        self.agent._stream_diag_capture_response(self.clients.diag, response)
         self._reabort_if_cancelled(response)
 
     def _reabort_if_cancelled(self, response: Any) -> None:

@@ -122,3 +122,60 @@ def test_interrupt_during_connect_window_shuts_down_the_late_socket(monkeypatch,
     finally:
         reader.close()
         writer.close()
+
+
+def test_gemini_native_stream_abort_shuts_down_active_response_socket():
+    """GeminiNativeClient opens its HTTP stream lazily on first iteration; once
+    response headers arrive (or during connect), both ``_attempt_stream_response``
+    and ``force_close_tcp_sockets(client)`` must reach the underlying socket instead
+    of logging ``tcp_force_closed=0 — no sockets found``."""
+    from agent.agent_runtime_helpers import force_close_tcp_sockets
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    reader, writer = _socket.socketpair()
+    try:
+        resp = _response_over(reader)
+        resp.status_code = 200
+
+        class _HangingHTTP:
+            def __init__(self):
+                self._transport = None
+                self._mounts = {}
+
+            def stream(self, *args, **kwargs):
+                class _Ctx:
+                    def __enter__(_self):
+                        return resp
+
+                    def __exit__(_self, *exc):
+                        return False
+
+                return _Ctx()
+
+            def close(self):
+                return None
+
+        client = GeminiNativeClient(
+            api_key="AIzaSyTestKey12345678901234567890123",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            http_client=_HangingHTTP(),  # type: ignore[arg-type]
+        )
+        call = _call(_agent())
+        raw_stream = client.chat.completions.create(
+            model="gemini-4-argon",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+        call._chat_stream_created(raw_stream)
+        assert call._attempt_stream_response is None
+
+        # Simulate entering the HTTP stream context up to waiting for first SSE chunk
+        raw_stream._set_response(resp)
+        client._active_response = resp
+        assert call._attempt_stream_response is resp
+        assert force_close_tcp_sockets(client) == 1
+        _assert_shut_down(reader, writer)
+    finally:
+        reader.close()
+        writer.close()
+
