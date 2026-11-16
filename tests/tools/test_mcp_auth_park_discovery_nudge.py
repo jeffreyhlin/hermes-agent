@@ -55,3 +55,46 @@ def test_auth_parked_oauth_server_ignores_discovery_until_credentials_change(mon
         await asyncio.wait_for(run, 5)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.no_isolate
+def test_auth_parked_oauth_server_skips_periodic_self_probe_until_credentials_change(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+    from tools.mcp_oauth import HermesTokenStorage, OAuthNonInteractiveError
+    from tools.mcp_tool import MCPServerTask
+
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 0.01)
+    cfg = {"url": "https://mcp.example.test/mcp", "auth": "oauth"}
+    token_file = HermesTokenStorage("cloud")._tokens_path()
+    token_file.parent.mkdir(parents=True)
+    token_file.write_text(json.dumps({"access_token": "a", "token_type": "Bearer", "refresh_token": "dead"}))
+    attempts = []
+
+    class _Task(MCPServerTask):
+        def _deregister_tools(self):
+            self._registered_tool_names = []
+
+        def _still_configured_enabled(self) -> bool:
+            return True
+
+        async def _run_http(self, config):
+            attempts.append(config["url"])
+            raise OAuthNonInteractiveError("non-interactive environment and no cached tokens found")
+
+    async def scenario():
+        task = _Task("cloud")
+        monkeypatch.setitem(mcp_tool._servers, "cloud", task)
+        run = asyncio.ensure_future(task.run(cfg))
+        await asyncio.sleep(0.05)  # multiple _PARKED_RETRY_INTERVAL self-probe ticks
+        assert len(attempts) == 1
+        assert task._auth_park is not None
+
+        token_file.write_text(json.dumps({"access_token": "b", "token_type": "Bearer", "refresh_token": "new"}))
+        await asyncio.sleep(0.05)  # next self-probe sees updated credential_stamp and revives
+        assert len(attempts) == 2
+
+        task._shutdown_event.set()
+        await asyncio.wait_for(run, 5)
+
+    asyncio.run(scenario())

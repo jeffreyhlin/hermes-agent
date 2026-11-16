@@ -228,6 +228,8 @@ class MCPServerRunMixin:
             # revival of a once-parked server is unattended too. Left interactive, an expired
             # refresh token opened a new authorize tab every _PARKED_RETRY_INTERVAL, all night.
             if outcome == "self-probe":
+                if self._auth_park is not None and self._auth_park[0].credential_stamp() == self._auth_park[1]:
+                    continue
                 from tools.mcp_oauth import _oauth_interactive_enabled
 
                 _oauth_interactive_enabled.set(False)
