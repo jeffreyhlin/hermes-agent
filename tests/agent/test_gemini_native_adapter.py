@@ -1040,3 +1040,28 @@ def test_prompt_feedback_without_block_reason_keeps_empty_turn(monkeypatch):
     client = _blocking_client(monkeypatch, {"promptFeedback": {"safetyRatings": []}})
     out = client.chat.completions.create(model="gemini-2.5-flash", messages=[{"role": "user", "content": "hi"}])
     assert out.choices[0].finish_reason == "stop"
+
+
+def test_orphaned_leading_tool_turns_dropped_before_compaction_summary():
+    from agent.gemini_native_adapter import build_gemini_request
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_orphan_1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": '{"command":"ls"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_orphan_1", "name": "terminal", "content": "ok"},
+        {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY]\nSummary"},
+        {"role": "assistant", "content": "Ready."},
+        {"role": "user", "content": "Next task"},
+    ]
+    req = build_gemini_request(messages=messages, model="gemini-4-argon")
+    assert [c["role"] for c in req["contents"]] == ["user", "model", "user"]
+    assert "Summary" in req["contents"][0]["parts"][0]["text"]

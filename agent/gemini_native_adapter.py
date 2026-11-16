@@ -394,6 +394,10 @@ def _has_function_response(content: dict[str, Any]) -> bool:
     return any(isinstance(part, dict) and "functionResponse" in part for part in content.get("parts", []))
 
 
+def _has_function_call(content: dict[str, Any]) -> bool:
+    return any(isinstance(part, dict) and "functionCall" in part for part in content.get("parts", []))
+
+
 def _merge_alternating(contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Alternation contract for generateContent: 1) adjacent same-role contents merge (else HTTP 400
     "multiturn requests [must] alternate"); 2) EXCEPT never fuse a human user text turn into a preceding
@@ -401,6 +405,15 @@ def _merge_alternating(contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     reads the text as a continuation of the tool result and returns an empty candidate (parallel
     functionResponse + functionResponse still merge); 3) the split pair stays API-valid via an interposed
     placeholder model turn."""
+    start = 0
+    while start < len(contents) and (
+        (contents[start]["role"] == "model" and _has_function_call(contents[start]))
+        or (contents[start]["role"] == "user" and _has_function_response(contents[start]))
+    ):
+        start += 1
+    if start and start < len(contents):
+        contents = contents[start:]
+
     merged: list[dict[str, Any]] = []
     # Compatibility contract for native Gemini generateContent: 1) Same-role adjacent contents still merge
     # in general (strict user/model alternation for ordinary text turns and parallel tool-result grouping;
